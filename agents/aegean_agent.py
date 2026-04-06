@@ -1,8 +1,10 @@
 import csv
 import json
+import logging
 import os
 import re
 import time
+from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
 from threading import Lock
@@ -14,21 +16,18 @@ from arcengine import FrameData, GameAction, GameState
 
 from .agent import Agent
 
+logger = logging.getLogger()
+
 
 class AegeanAgent(Agent):
     """
     ARC agent powered by aegean-consensus via HTTP API.
 
-    Flow per step:
-      1) Build an ARC state prompt from latest frame
-      2) Call aegean-consensus group consensus endpoint
-      3) Parse final answer into ARC action (RESET/ACTION1..ACTION6)
-      4) Fallback safely if malformed output
-
-    Extra telemetry:
-      - per-game token totals
-      - per-game consensus latency totals
-      - optional local CSV export
+    This version adds four practical safeguards:
+      1) Reuses one Aegean group per ARC game
+      2) Prevents RESET spam during active gameplay
+      3) Sends a compact frame summary instead of full raw grid
+      4) Logs enough debug context to inspect consensus behavior
     """
 
     MAX_ACTIONS = 80
@@ -43,10 +42,13 @@ class AegeanAgent(Agent):
         self.quorum_threshold = float(os.getenv("AEGEAN_ARC_QUORUM", "0.5"))
         self.agent_count = int(os.getenv("AEGEAN_ARC_AGENT_COUNT", "3"))
         self.include_frame = os.getenv("AEGEAN_ARC_INCLUDE_FRAME", "true").lower() == "true"
-        self.max_prompt_chars = int(os.getenv("AEGEAN_ARC_MAX_PROMPT_CHARS", "12000"))
+        self.max_prompt_chars = int(os.getenv("AEGEAN_ARC_MAX_PROMPT_CHARS", "4000"))
+        self.debug = os.getenv("AEGEAN_ARC_DEBUG", "true").lower() == "true"
+        self.max_history = int(os.getenv("AEGEAN_ARC_HISTORY", "6"))
 
         self.group_id: Optional[str] = None
         self._group_deleted = False
+        self._metrics_written = False
 
         # Per-game telemetry
         self.step_count = 0
@@ -54,6 +56,8 @@ class AegeanAgent(Agent):
         self.total_tokens_completion = 0
         self.total_consensus_latency_s = 0.0
         self.last_raw_answer = ""
+        self.last_action_name = ""
+        self.last_fallback_reason = ""
 
     @property
     def name(self) -> str:
@@ -93,25 +97,47 @@ class AegeanAgent(Agent):
             self.last_raw_answer = raw_answer
 
             action = self._safe_parse_action(raw_answer, latest_frame)
+            self.last_action_name = action.name
+
             if action.is_simple():
                 action.reasoning = (
                     f"aegean-consensus action={action.name} "
                     f"tokens={tp + tc} latency={latency:.3f}s"
                 )
+
+            self._debug_log(
+                step=self.step_count,
+                state=latest_frame.state.name,
+                raw_answer=raw_answer,
+                action=action.name,
+                prompt_tokens=tp,
+                completion_tokens=tc,
+                latency=latency,
+            )
             return action
 
         except Exception as e:  # noqa: BLE001
-            return self._fallback_action(latest_frame, f"aegean_error: {e}")
+            action = self._fallback_action(latest_frame, f"aegean_error: {e}")
+            self.last_action_name = action.name
+            self._debug_log(
+                step=self.step_count,
+                state=latest_frame.state.name,
+                raw_answer="",
+                action=action.name,
+                prompt_tokens=0,
+                completion_tokens=0,
+                latency=0.0,
+                error=str(e),
+            )
+            return action
 
     def cleanup(self, scorecard: Optional[EnvironmentScorecard] = None) -> None:
-        # Ensure group is removed at game end
         self._delete_group_if_needed()
 
-        # Export game-level metrics to local CSV
         try:
             self._append_game_metrics_csv()
-        except Exception:
-            pass
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("failed to write Aegean metrics CSV: %s", exc)
 
         super().cleanup(scorecard)
 
@@ -130,6 +156,7 @@ class AegeanAgent(Agent):
         )
         group_resp.raise_for_status()
         self.group_id = group_resp.json()["group_id"]
+        logger.info("Aegean group created for %s: %s", self.game_id, self.group_id)
 
         agents_resp = requests.get(
             f"{self.base_url}/api/v1/groups/agents",
@@ -144,6 +171,7 @@ class AegeanAgent(Agent):
         if target_count <= 0:
             raise RuntimeError("No agents can be added to aegean group")
 
+        selected_ids: list[str] = []
         for i in range(target_count):
             agent_id = available_agents[i]["agent_id"]
             add_resp = requests.post(
@@ -156,6 +184,8 @@ class AegeanAgent(Agent):
                 timeout=self.timeout,
             )
             add_resp.raise_for_status()
+            selected_ids.append(agent_id)
+        logger.info("Aegean group %s members: %s", self.group_id, selected_ids)
 
     def _delete_group_if_needed(self) -> None:
         if self._group_deleted or not self.group_id:
@@ -165,68 +195,126 @@ class AegeanAgent(Agent):
                 f"{self.base_url}/api/v1/groups/{self.group_id}",
                 timeout=self.timeout,
             )
+            logger.info("Aegean group deleted for %s: %s", self.game_id, self.group_id)
         finally:
             self._group_deleted = True
 
     def _build_task(self, frames: list[FrameData], latest_frame: FrameData) -> str:
-        frame_payload = ""
-        if self.include_frame:
-            try:
-                frame_payload = json.dumps(latest_frame.frame, separators=(",", ":"))
-            except Exception:
-                frame_payload = str(latest_frame.frame)
-
-        available_actions = []
-        try:
-            available_actions = [a.name for a in latest_frame.available_actions]
-        except Exception:
-            pass
+        available_actions = self._available_action_names(latest_frame)
+        frame_summary = self._summarize_frame(latest_frame) if self.include_frame else "frame_summary=disabled"
+        recent_actions = self._recent_actions(frames)
+        active_gameplay = latest_frame.state not in [GameState.NOT_PLAYED, GameState.GAME_OVER]
 
         prompt = (
             "You are controlling an ARC-AGI-3 environment.\n"
-            "Return EXACTLY one valid action token and nothing else:\n"
-            "RESET, ACTION1, ACTION2, ACTION3, ACTION4, ACTION5, ACTION6\n\n"
+            "Return EXACTLY one token and nothing else.\n"
+            "Allowed tokens: RESET, ACTION1, ACTION2, ACTION3, ACTION4, ACTION5, ACTION6.\n\n"
+            "Hard rules:\n"
+            "- If state is NOT_PLAYED or GAME_OVER, return RESET.\n"
+            "- Otherwise NEVER return RESET.\n"
+            "- During active gameplay, you MUST return one of ACTION1, ACTION2, ACTION3, ACTION4, ACTION5, ACTION6.\n"
+            "- Do not explain your answer.\n\n"
             f"state={latest_frame.state.name}\n"
+            f"active_gameplay={str(active_gameplay).lower()}\n"
             f"levels_completed={latest_frame.levels_completed}\n"
             f"available_actions={available_actions}\n"
+            f"recent_actions={recent_actions}\n"
+            f"{frame_summary}\n"
         )
-
-        if frame_payload:
-            prompt += f"frame={frame_payload}\n"
 
         if len(prompt) > self.max_prompt_chars:
             prompt = prompt[: self.max_prompt_chars] + "\n[TRUNCATED]"
 
         return prompt
 
+    def _available_action_names(self, latest_frame: FrameData) -> list[str]:
+        try:
+            return [a.name for a in latest_frame.available_actions]
+        except Exception:
+            return []
+
+    def _recent_actions(self, frames: list[FrameData]) -> list[str]:
+        history: list[str] = []
+        for frame in frames[-self.max_history :]:
+            action_input = getattr(frame, "action_input", None)
+            action_id = getattr(action_input, "id", None)
+            if action_id is not None:
+                history.append(action_id.name)
+        return history
+
+    def _summarize_frame(self, latest_frame: FrameData) -> str:
+        frame = latest_frame.frame
+        if not frame:
+            return "frame_summary=empty"
+
+        layers = len(frame)
+        height = len(frame[0]) if frame and frame[0] else 0
+        width = len(frame[0][0]) if height and frame[0][0] else 0
+
+        colors = Counter()
+        sample_rows: list[str] = []
+
+        first_layer = frame[0] if frame else []
+        for row_idx, row in enumerate(first_layer):
+            colors.update(row)
+            if row_idx < 6:
+                sample_rows.append("".join(self._encode_cell(cell) for cell in row[:24]))
+
+        top_colors = colors.most_common(6)
+        return (
+            f"frame_dims={layers}x{height}x{width}\n"
+            f"top_colors={top_colors}\n"
+            f"sample_rows={sample_rows}"
+        )
+
+    @staticmethod
+    def _encode_cell(cell: Any) -> str:
+        try:
+            value = int(cell)
+        except (TypeError, ValueError):
+            return "?"
+        alphabet = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
+        if 0 <= value < len(alphabet):
+            return alphabet[value]
+        return "*"
+
     def _safe_parse_action(self, text: str, latest_frame: FrameData) -> GameAction:
         if not text:
             return self._fallback_action(latest_frame, "empty answer")
 
-        # Accept direct token, JSON-like strings, or verbose output
         upper = text.upper().strip()
-        m = re.search(r"(RESET|ACTION[1-6])", upper)
-        if not m:
+        match = re.search(r"(RESET|ACTION[1-6])", upper)
+        if not match:
             return self._fallback_action(latest_frame, f"invalid answer: {text[:80]}")
 
-        name = m.group(1)
+        name = match.group(1)
         action = GameAction.from_name(name)
 
-        # ACTION6 requires coordinates; provide safe center default
+        if latest_frame.state not in [GameState.NOT_PLAYED, GameState.GAME_OVER] and action is GameAction.RESET:
+            return self._fallback_action(latest_frame, "guard blocked RESET during active gameplay")
+
         if action is GameAction.ACTION6:
             action.set_data({"x": 32, "y": 32})
 
         return action
 
     def _fallback_action(self, latest_frame: FrameData, reason: str) -> GameAction:
+        self.last_fallback_reason = reason
         if latest_frame.state in [GameState.NOT_PLAYED, GameState.GAME_OVER]:
             action = GameAction.RESET
         else:
-            # Safe fallback: avoid ACTION6 when no coordinates are available
             action = GameAction.ACTION5
 
         if action.is_simple():
             action.reasoning = f"fallback: {reason}"
+        logger.warning(
+            "Aegean fallback for %s step=%s state=%s -> %s (%s)",
+            self.game_id,
+            self.step_count,
+            latest_frame.state.name,
+            action.name,
+            reason,
+        )
         return action
 
     @staticmethod
@@ -265,6 +353,10 @@ class AegeanAgent(Agent):
         return prompt, completion
 
     def _append_game_metrics_csv(self) -> None:
+        if self._metrics_written:
+            return
+        self._metrics_written = True
+
         csv_path = Path(os.getenv("AEGEAN_ARC_METRICS_CSV", "aegean_arc_metrics.csv"))
         csv_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -286,6 +378,8 @@ class AegeanAgent(Agent):
             "levels_completed": self.levels_completed,
             "final_state": self.state.name,
             "last_raw_answer": self.last_raw_answer[:120],
+            "last_action_name": self.last_action_name,
+            "last_fallback_reason": self.last_fallback_reason[:160],
         }
 
         fieldnames = list(row.keys())
@@ -297,3 +391,29 @@ class AegeanAgent(Agent):
                     writer.writeheader()
                 writer.writerow(row)
 
+    def _debug_log(
+        self,
+        *,
+        step: int,
+        state: str,
+        raw_answer: str,
+        action: str,
+        prompt_tokens: int,
+        completion_tokens: int,
+        latency: float,
+        error: str = "",
+    ) -> None:
+        if not self.debug:
+            return
+        logger.info(
+            "Aegean step=%s game=%s state=%s raw=%r action=%s prompt_tokens=%s completion_tokens=%s latency=%.3fs error=%s",
+            step,
+            self.game_id,
+            state,
+            raw_answer[:120],
+            action,
+            prompt_tokens,
+            completion_tokens,
+            latency,
+            error[:160],
+        )
