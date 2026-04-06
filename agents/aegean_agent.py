@@ -23,14 +23,18 @@ class AegeanAgent(Agent):
     """
     ARC agent powered by aegean-consensus via HTTP API.
 
-    This version adds four practical safeguards:
-      1) Reuses one Aegean group per ARC game
-      2) Prevents RESET spam during active gameplay
-      3) Sends a compact frame summary instead of full raw grid
-      4) Logs enough debug context to inspect consensus behavior
+    This wrapper keeps the original consensus service unchanged and adds
+    lightweight control logic to make it more usable for sequential ARC tasks.
     """
 
     MAX_ACTIONS = 80
+    SIMPLE_ACTIONS = [
+        GameAction.ACTION1,
+        GameAction.ACTION2,
+        GameAction.ACTION3,
+        GameAction.ACTION4,
+        GameAction.ACTION5,
+    ]
 
     _csv_lock = Lock()
 
@@ -42,15 +46,17 @@ class AegeanAgent(Agent):
         self.quorum_threshold = float(os.getenv("AEGEAN_ARC_QUORUM", "0.5"))
         self.agent_count = int(os.getenv("AEGEAN_ARC_AGENT_COUNT", "3"))
         self.include_frame = os.getenv("AEGEAN_ARC_INCLUDE_FRAME", "true").lower() == "true"
-        self.max_prompt_chars = int(os.getenv("AEGEAN_ARC_MAX_PROMPT_CHARS", "4000"))
+        self.max_prompt_chars = int(os.getenv("AEGEAN_ARC_MAX_PROMPT_CHARS", "2500"))
         self.debug = os.getenv("AEGEAN_ARC_DEBUG", "true").lower() == "true"
         self.max_history = int(os.getenv("AEGEAN_ARC_HISTORY", "6"))
+        self.repeat_guard_window = int(os.getenv("AEGEAN_ARC_REPEAT_GUARD", "4"))
+        self.stall_guard_window = int(os.getenv("AEGEAN_ARC_STALL_GUARD", "6"))
+        self.explore_burst_len = int(os.getenv("AEGEAN_ARC_EXPLORE_BURST", "2"))
 
         self.group_id: Optional[str] = None
         self._group_deleted = False
         self._metrics_written = False
 
-        # Per-game telemetry
         self.step_count = 0
         self.total_tokens_prompt = 0
         self.total_tokens_completion = 0
@@ -58,6 +64,12 @@ class AegeanAgent(Agent):
         self.last_raw_answer = ""
         self.last_action_name = ""
         self.last_fallback_reason = ""
+
+        self.action_history: list[str] = []
+        self.level_history: list[int] = []
+        self.frame_signature_history: list[str] = []
+        self.exploration_queue: list[str] = []
+        self.exploration_reason = ""
 
     @property
     def name(self) -> str:
@@ -97,12 +109,14 @@ class AegeanAgent(Agent):
             self.last_raw_answer = raw_answer
 
             action = self._safe_parse_action(raw_answer, latest_frame)
+            action = self._apply_exploration_guard(action, latest_frame)
             self.last_action_name = action.name
 
             if action.is_simple():
+                suffix = f" explore={self.exploration_reason}" if self.exploration_reason else ""
                 action.reasoning = (
                     f"aegean-consensus action={action.name} "
-                    f"tokens={tp + tc} latency={latency:.3f}s"
+                    f"tokens={tp + tc} latency={latency:.3f}s{suffix}"
                 )
 
             self._debug_log(
@@ -113,11 +127,13 @@ class AegeanAgent(Agent):
                 prompt_tokens=tp,
                 completion_tokens=tc,
                 latency=latency,
+                guard=self.exploration_reason,
             )
             return action
 
         except Exception as e:  # noqa: BLE001
             action = self._fallback_action(latest_frame, f"aegean_error: {e}")
+            action = self._apply_exploration_guard(action, latest_frame)
             self.last_action_name = action.name
             self._debug_log(
                 step=self.step_count,
@@ -128,6 +144,7 @@ class AegeanAgent(Agent):
                 completion_tokens=0,
                 latency=0.0,
                 error=str(e),
+                guard=self.exploration_reason,
             )
             return action
 
@@ -202,8 +219,9 @@ class AegeanAgent(Agent):
     def _build_task(self, frames: list[FrameData], latest_frame: FrameData) -> str:
         available_actions = self._available_action_names(latest_frame)
         frame_summary = self._summarize_frame(latest_frame) if self.include_frame else "frame_summary=disabled"
-        recent_actions = self._recent_actions(frames)
+        recent_actions = self.action_history[-self.max_history :]
         active_gameplay = latest_frame.state not in [GameState.NOT_PLAYED, GameState.GAME_OVER]
+        exploration_hint = self._exploration_hint(latest_frame)
 
         prompt = (
             "You are controlling an ARC-AGI-3 environment.\n"
@@ -212,13 +230,15 @@ class AegeanAgent(Agent):
             "Hard rules:\n"
             "- If state is NOT_PLAYED or GAME_OVER, return RESET.\n"
             "- Otherwise NEVER return RESET.\n"
-            "- During active gameplay, you MUST return one of ACTION1, ACTION2, ACTION3, ACTION4, ACTION5, ACTION6.\n"
+            "- During active gameplay, return one of ACTION1, ACTION2, ACTION3, ACTION4, ACTION5, ACTION6.\n"
+            "- If recent actions are repeating without progress, choose a different action.\n"
             "- Do not explain your answer.\n\n"
             f"state={latest_frame.state.name}\n"
             f"active_gameplay={str(active_gameplay).lower()}\n"
             f"levels_completed={latest_frame.levels_completed}\n"
             f"available_actions={available_actions}\n"
             f"recent_actions={recent_actions}\n"
+            f"{exploration_hint}\n"
             f"{frame_summary}\n"
         )
 
@@ -233,14 +253,14 @@ class AegeanAgent(Agent):
         except Exception:
             return []
 
-    def _recent_actions(self, frames: list[FrameData]) -> list[str]:
-        history: list[str] = []
-        for frame in frames[-self.max_history :]:
-            action_input = getattr(frame, "action_input", None)
-            action_id = getattr(action_input, "id", None)
-            if action_id is not None:
-                history.append(action_id.name)
-        return history
+    def _exploration_hint(self, latest_frame: FrameData) -> str:
+        repeated = self._repeated_action_name()
+        stalled = self._is_stalled(latest_frame)
+        if repeated and stalled:
+            return f"exploration_hint=avoid_{repeated};try_different_action"
+        if stalled:
+            return "exploration_hint=no_progress_detected;explore_alternative"
+        return "exploration_hint=none"
 
     def _summarize_frame(self, latest_frame: FrameData) -> str:
         frame = latest_frame.frame
@@ -253,14 +273,13 @@ class AegeanAgent(Agent):
 
         colors = Counter()
         sample_rows: list[str] = []
-
         first_layer = frame[0] if frame else []
         for row_idx, row in enumerate(first_layer):
             colors.update(row)
-            if row_idx < 6:
-                sample_rows.append("".join(self._encode_cell(cell) for cell in row[:24]))
+            if row_idx < 3:
+                sample_rows.append("".join(self._encode_cell(cell) for cell in row[:12]))
 
-        top_colors = colors.most_common(6)
+        top_colors = colors.most_common(4)
         return (
             f"frame_dims={layers}x{height}x{width}\n"
             f"top_colors={top_colors}\n"
@@ -296,6 +315,91 @@ class AegeanAgent(Agent):
         if action is GameAction.ACTION6:
             action.set_data({"x": 32, "y": 32})
 
+        return action
+
+    def _apply_exploration_guard(self, action: GameAction, latest_frame: FrameData) -> GameAction:
+        self.exploration_reason = ""
+        self._record_observation(latest_frame)
+
+        if latest_frame.state in [GameState.NOT_PLAYED, GameState.GAME_OVER]:
+            self.action_history.append(action.name)
+            return action
+
+        queued = self._next_queued_exploration_action()
+        if queued:
+            guarded = self._build_simple_action(queued)
+            self.exploration_reason = f"queued_exploration:{queued}"
+            self.action_history.append(guarded.name)
+            logger.info("Aegean exploration override for %s -> %s", self.game_id, guarded.name)
+            return guarded
+
+        repeated = self._repeated_action_name()
+        stalled = self._is_stalled(latest_frame)
+
+        if repeated and stalled and action.name == repeated:
+            alternatives = self._exploration_candidates(exclude={repeated})
+            if alternatives:
+                self.exploration_queue = alternatives[1 : self.explore_burst_len]
+                guarded = self._build_simple_action(alternatives[0])
+                self.exploration_reason = f"anti_collapse:{repeated}->{guarded.name}"
+                self.action_history.append(guarded.name)
+                logger.info(
+                    "Aegean anti-collapse override for %s repeated=%s -> %s",
+                    self.game_id,
+                    repeated,
+                    guarded.name,
+                )
+                return guarded
+
+        self.action_history.append(action.name)
+        return action
+
+    def _record_observation(self, latest_frame: FrameData) -> None:
+        self.level_history.append(latest_frame.levels_completed)
+        self.frame_signature_history.append(self._frame_signature(latest_frame))
+        self.level_history = self.level_history[-self.stall_guard_window :]
+        self.frame_signature_history = self.frame_signature_history[-self.stall_guard_window :]
+
+    def _frame_signature(self, latest_frame: FrameData) -> str:
+        frame = latest_frame.frame
+        if not frame or not frame[0]:
+            return "empty"
+        first_layer = frame[0]
+        colors = Counter()
+        for row in first_layer[:8]:
+            colors.update(row[:16])
+        return str(colors.most_common(5))
+
+    def _repeated_action_name(self) -> str:
+        if len(self.action_history) < self.repeat_guard_window:
+            return ""
+        recent = self.action_history[-self.repeat_guard_window :]
+        if len(set(recent)) == 1:
+            return recent[0]
+        return ""
+
+    def _is_stalled(self, latest_frame: FrameData) -> bool:
+        if len(self.level_history) < self.stall_guard_window:
+            return False
+        same_levels = len(set(self.level_history[-self.stall_guard_window :])) == 1
+        same_frames = len(set(self.frame_signature_history[-self.stall_guard_window :])) == 1
+        no_level_progress = latest_frame.levels_completed == self.level_history[-1]
+        return same_levels and same_frames and no_level_progress
+
+    def _exploration_candidates(self, exclude: set[str]) -> list[str]:
+        recent = self.action_history[-self.max_history :]
+        base_candidates = [a.name for a in self.SIMPLE_ACTIONS if a.name not in exclude]
+        return sorted(base_candidates, key=lambda name: (recent.count(name), name))
+
+    def _next_queued_exploration_action(self) -> str:
+        if not self.exploration_queue:
+            return ""
+        return self.exploration_queue.pop(0)
+
+    def _build_simple_action(self, name: str) -> GameAction:
+        action = GameAction.from_name(name)
+        if action is GameAction.ACTION6:
+            action.set_data({"x": 32, "y": 32})
         return action
 
     def _fallback_action(self, latest_frame: FrameData, reason: str) -> GameAction:
@@ -380,6 +484,7 @@ class AegeanAgent(Agent):
             "last_raw_answer": self.last_raw_answer[:120],
             "last_action_name": self.last_action_name,
             "last_fallback_reason": self.last_fallback_reason[:160],
+            "exploration_queue_remaining": "|".join(self.exploration_queue),
         }
 
         fieldnames = list(row.keys())
@@ -402,11 +507,12 @@ class AegeanAgent(Agent):
         completion_tokens: int,
         latency: float,
         error: str = "",
+        guard: str = "",
     ) -> None:
         if not self.debug:
             return
         logger.info(
-            "Aegean step=%s game=%s state=%s raw=%r action=%s prompt_tokens=%s completion_tokens=%s latency=%.3fs error=%s",
+            "Aegean step=%s game=%s state=%s raw=%r action=%s prompt_tokens=%s completion_tokens=%s latency=%.3fs guard=%s error=%s",
             step,
             self.game_id,
             state,
@@ -415,5 +521,6 @@ class AegeanAgent(Agent):
             prompt_tokens,
             completion_tokens,
             latency,
+            guard[:120],
             error[:160],
         )
